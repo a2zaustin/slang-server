@@ -71,6 +71,7 @@ void Indexer::extractMacros(const MacroRange& macros, IndexedPath& dest) {
     }
 }
 
+// TODO look at for speed improvements
 std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path>& paths) const {
     using namespace slang;
     using namespace parsing;
@@ -88,6 +89,7 @@ std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path
     auto processRange = [&loadResults, &paths](size_t start, size_t end) {
         SourceManager sourceManager;
         Bag options;
+        // TODO why is this set to 0
         options.set(PreprocessorOptions{.maxIncludeDepth = 0});
 
         SmallVector<char> bufferData;
@@ -140,6 +142,7 @@ const fs::path* Indexer::internUri(const fs::path& path) {
     return &(*it);
 }
 
+// TODO look at for speed improvements
 void Indexer::updateDocument(const fs::path& path, const slang::syntax::SyntaxTree& tree) {
     IndexWriteGuard guard(*this);
 
@@ -212,6 +215,7 @@ void Indexer::updateDocument(const fs::path& path, const slang::syntax::SyntaxTr
     indexedFiles[uriPtr] = std::move(newPath);
 }
 
+// TODO look at for speed improvements
 void Indexer::indexPath(const fs::path& path, IndexedPath& indexedFile) {
     const fs::path* uriPtr = internUri(path);
     indexedFile.path = uriPtr;
@@ -361,6 +365,64 @@ std::vector<std::string> Indexer::getAllMacroNames() const {
 size_t Indexer::getSymbolCount() const {
     IndexReadGuard guard(*this);
     return symbolToFiles_.size();
+}
+
+void Indexer::addBuildSource(const fs::path& path, const slang::syntax::SyntaxTree& tree) {
+    using namespace slang::syntax;
+    IndexWriteGuard guard(*this);
+    const fs::path* uriPtr = internUri(path);
+    // Skip if already indexed (e.g. the workspace scan covered it).
+    if (indexedFiles.count(uriPtr))
+        return;
+
+    // Harvest only the top-level declared symbols (packages/modules/interfaces) directly from
+    // the already-parsed tree. We deliberately do NOT extract referenced symbols: a build-file
+    // tree is fully include-expanded, so its referenced-symbol set is the entire compiled
+    // universe and would flood symbolReferences_.
+    IndexedPath newPath;
+    newPath.path = uriPtr;
+    auto& root = tree.root().as<CompilationUnitSyntax>();
+    for (auto* member : root.members) {
+        if (!ModuleDeclarationSyntax::isKind(member->kind))
+            continue;
+        auto name = member->as<ModuleDeclarationSyntax>().header->name.valueText();
+        if (!name.empty())
+            newPath.symbols.push_back(
+                GlobalSymbol{.name = std::string(name), .kind = member->kind});
+    }
+
+    for (const auto& s : newPath.symbols)
+        symbolToFiles_[s.name].push_back(GlobalSymbolLoc{.uri = uriPtr, .kind = s.kind});
+
+    indexedFiles[uriPtr] = std::move(newPath);
+}
+
+void Indexer::registerPackageIncludes(const fs::path& pkgPath,
+                                      const slang::syntax::SyntaxTree& tree,
+                                      slang::SourceManager& sm) {
+    IndexWriteGuard guard(*this);
+    // Clear stale entries for this package before re-registering
+    for (auto it = includeToOwner_.begin(); it != includeToOwner_.end();) {
+        if (it->second == pkgPath)
+            it = includeToOwner_.erase(it);
+        else
+            ++it;
+    }
+    for (auto& meta : tree.getIncludeDirectives()) {
+        if (!meta.buffer.id.valid())
+            continue;
+        auto resolved = sm.getFullPath(meta.buffer.id);
+        if (!resolved.empty())
+            includeToOwner_[resolved] = pkgPath;
+    }
+}
+
+std::optional<fs::path> Indexer::getOwningPackage(const fs::path& path) const {
+    IndexReadGuard guard(*this);
+    auto it = includeToOwner_.find(path);
+    if (it != includeToOwner_.end())
+        return it->second;
+    return std::nullopt;
 }
 
 bool isSystemVerilogFile(const fs::path& path) {

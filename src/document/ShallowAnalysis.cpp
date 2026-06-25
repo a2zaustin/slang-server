@@ -59,7 +59,7 @@ static bool symbolsMatch(const ast::Symbol* a, const ast::Symbol* b) {
 ShallowAnalysis::ShallowAnalysis(SourceManager& sourceManager, slang::BufferID buffer,
                                  std::shared_ptr<SyntaxTree> tree, slang::Bag options,
                                  const std::vector<std::shared_ptr<SyntaxTree>>& allTrees) :
-    syntaxes(*tree), m_sourceManager(sourceManager), m_buffer(buffer), m_tree(tree),
+    syntaxes(*tree, buffer), m_sourceManager(sourceManager), m_buffer(buffer), m_tree(tree),
     m_allTrees(allTrees), m_analysisOptions(options.getOrDefault<analysis::AnalysisOptions>()),
     m_symbolTreeVisitor(m_sourceManager), m_symbolIndexer(buffer) {
 
@@ -519,14 +519,36 @@ void ShallowAnalysis::addLocalReferences(std::vector<lsp::Location>& references,
 
 std::vector<lsp::DocumentLink> ShallowAnalysis::getDocLinks() const {
     std::vector<lsp::DocumentLink> links;
+
+    // Include-once guards: when a header is included more than once, slang only resolves a
+    // real buffer for the first occurrence; repeat includes get an invalid buffer id. Build a
+    // path -> resolved-path map from every include that DID resolve, so repeat includes (e.g.
+    // `include "uvm_macros.svh" nested inside another already-included header) still navigate.
+    slang::flat_hash_map<std::string_view, std::filesystem::path> resolvedByPath;
+    for (auto& inc : m_tree->getIncludeDirectives()) {
+        if (inc.buffer.id.valid())
+            resolvedByPath.try_emplace(inc.path, m_sourceManager.getFullPath(inc.buffer.id));
+    }
+
     for (auto& inc : m_tree->getIncludeDirectives()) {
         // check buffer is in ours
         if (inc.syntax->fileName.location().buffer() != m_buffer) {
             continue;
         }
+        std::filesystem::path target;
+        if (inc.buffer.id.valid()) {
+            target = m_sourceManager.getFullPath(inc.buffer.id);
+        }
+        else {
+            auto it = resolvedByPath.find(inc.path);
+            if (it != resolvedByPath.end())
+                target = it->second;
+        }
+        if (target.empty())
+            continue;
         links.push_back(lsp::DocumentLink{
             .range = toRange(inc.syntax->fileName.range(), m_sourceManager),
-            .target = URI::fromFile(m_sourceManager.getFullPath(inc.buffer.id)),
+            .target = URI::fromFile(target),
         });
     }
     return links;

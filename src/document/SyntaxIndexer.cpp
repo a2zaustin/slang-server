@@ -42,6 +42,13 @@ SyntaxIndexer::SyntaxIndexer(const slang::syntax::SyntaxTree& tree) {
     flushMacroExpansion();
 }
 
+SyntaxIndexer::SyntaxIndexer(const slang::syntax::SyntaxTree& tree, slang::BufferID buffer) {
+    m_buffer = buffer;
+    m_sourceManager = &tree.sourceManager();
+    visit(tree.root());
+    flushMacroExpansion();
+}
+
 void SyntaxIndexer::visit(const slang::syntax::SyntaxNode& node) {
     switch (node.kind) {
         case syntax::SyntaxKind::MacroUsage: {

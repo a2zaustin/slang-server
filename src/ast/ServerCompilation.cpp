@@ -125,8 +125,7 @@ std::vector<std::string> ServerCompilation::getInstances(
         ERROR("Unknown doc: {}", params.textDocument.uri.getPath());
         return {};
     }
-    auto location = m_sourceManager.getSourceLocation(doc->getBuffer(), params.position.line,
-                                                      params.position.character);
+    auto location = doc->getLocation(params.position);
     if (location) {
         inst::InstanceVisitor visitor(*location);
         m_analysis->compilation.getRoot().visit(visitor);

@@ -158,6 +158,8 @@ public:
     ServerDriver(Indexer& indexer, SlangLspClient& client, const Config& config,
                  std::vector<std::string> buildfiles);
 
+    Indexer& getIndexer() { return m_indexer; }
+
     /// Map from macro name to the config/build file that defined it
     flat_hash_map<std::string, std::filesystem::path> m_defineSources;
 

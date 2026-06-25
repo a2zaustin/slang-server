@@ -112,10 +112,16 @@ void ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
     ok = driver.parseAllSources();
     diagEngine.setMappingsFromPragmas();
 
-    // Create documents from syntax trees
+    // Create documents from syntax trees and register include ownership
     INFO("Creating ServerDriver with {} trees", driver.syntaxTrees.size());
     for (auto& tree : driver.syntaxTrees) {
-        auto uri = URI::fromFile(sm.getFullPath(tree->getSourceBufferIds()[0]));
+        auto path = sm.getFullPath(tree->getSourceBufferIds()[0]);
+        auto uri = URI::fromFile(path);
+        // Index build-file sources so their symbols are reachable via goto-def even when
+        // the source lives outside the workspace folder (e.g. uvm_pkg in an external dir).
+        // Harvest top-level decls straight from the parsed tree — no re-parse needed.
+        m_indexer.addBuildSource(path, *tree);
+        m_indexer.registerPackageIncludes(path, *tree, sm);
         auto doc = SlangDoc::fromTree(*this, std::move(tree));
         docs[uri] = doc;
     }
@@ -357,13 +363,16 @@ std::vector<std::shared_ptr<SlangDoc>> ServerDriver::getDependentDocs(
                 result.push_back(newdoc);
                 docs[newdoc->getURI()] = newdoc;
 
-                // Recurse into packages and interfaces, since they may contain types from other
-                // packages that are referenced by the analyzed module.
-                for (auto& [decl, _] : newdoc->getSyntaxTree()->getMetadata().nodeMeta) {
-                    if (decl->kind == syntax::SyntaxKind::PackageDeclaration ||
-                        decl->kind == syntax::SyntaxKind::InterfaceDeclaration) {
-                        treesToProcess.push(newdoc->getSyntaxTree());
-                        break;
+                // Recurse into packages and interfaces so their transitive deps are included.
+                // Skip build-file docs: their trees are fully expanded and self-contained,
+                // so recursing into their metadata would pull in the entire compiled universe.
+                if (!newdoc->isFromBuildFile()) {
+                    for (auto& [decl, _] : newdoc->getSyntaxTree()->getMetadata().nodeMeta) {
+                        if (decl->kind == syntax::SyntaxKind::PackageDeclaration ||
+                            decl->kind == syntax::SyntaxKind::InterfaceDeclaration) {
+                            treesToProcess.push(newdoc->getSyntaxTree());
+                            break;
+                        }
                     }
                 }
             }
@@ -490,7 +499,7 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
     auto analysis = doc->getAnalysis();
 
     // Get location, token, and syntax node at position
-    auto loc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character);
+    auto loc = doc->getLocation(position);
     if (!loc) {
         return {};
     }
@@ -670,7 +679,7 @@ std::optional<lsp::Hover> ServerDriver::getDocHover(const URI& uri, const lsp::P
     if (!doc) {
         return {};
     }
-    auto loc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character);
+    auto loc = doc->getLocation(position);
     if (!loc) {
         return {};
     }
@@ -691,6 +700,29 @@ std::optional<lsp::Hover> ServerDriver::getDocHover(const URI& uri, const lsp::P
 
 std::vector<lsp::LocationLink> ServerDriver::getDocDefinition(const URI& uri,
                                                               const lsp::Position& position) {
+    // Check if the cursor is on an include path — if so, navigate to that file directly.
+    // This mirrors document-link behaviour for gd/go-to-definition.
+    auto doc = getDocument(uri);
+    if (doc) {
+        for (auto& link : doc->getDocLinks()) {
+            if (!link.target)
+                continue;
+            auto& r = link.range;
+            bool inRange = (position.line > r.start.line ||
+                            (position.line == r.start.line &&
+                             position.character >= r.start.character)) &&
+                           (position.line < r.end.line ||
+                            (position.line == r.end.line && position.character <= r.end.character));
+            if (inRange) {
+                lsp::Range fileStart{{0, 0}, {0, 0}};
+                return {lsp::LocationLink{.originSelectionRange = link.range,
+                                          .targetUri = *link.target,
+                                          .targetRange = fileStart,
+                                          .targetSelectionRange = fileStart}};
+            }
+        }
+    }
+
     auto maybeInfo = getDefinitionInfoAt(uri, position);
     if (!maybeInfo)
         return {};
@@ -706,7 +738,7 @@ std::optional<std::vector<lsp::DocumentHighlight>> ServerDriver::getDocDocumentH
     auto analysis = doc->getAnalysis();
 
     // Get the symbol at the position
-    auto loc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character);
+    auto loc = doc->getLocation(position);
     if (!loc) {
         return std::nullopt;
     }
@@ -804,7 +836,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
     // Get the symbol at the position. Hold the analysis via shared_ptr so that
     // targetSymbol remains valid even if getAnalysis() is called on this doc again.
     auto analysis = doc->getAnalysis();
-    auto loc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character);
+    auto loc = doc->getLocation(position);
     if (!loc) {
         return std::nullopt;
     }

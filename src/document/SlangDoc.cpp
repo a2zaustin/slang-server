@@ -8,11 +8,14 @@
 
 #include "document/SlangDoc.h"
 
+#include "Indexer.h"
 #include "ServerDriver.h"
 #include "document/ShallowAnalysis.h"
+#include "document/SymbolTreeVisitor.h"
 #include "lsp/URI.h"
 #include "util/Logging.h"
 #include "util/SlangExtensions.h"
+#include <filesystem>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <stdexcept>
@@ -45,6 +48,7 @@ std::shared_ptr<SlangDoc> SlangDoc::fromTree(ServerDriver& driver,
     auto uri = URI::fromFile(driver.sm.getFullPath(tree->getSourceBufferIds()[0]));
     auto ret = std::make_shared<SlangDoc>(driver, uri, buffer);
     ret->m_tree = tree;
+    ret->m_isFromBuildFile = true;
     return ret;
 }
 
@@ -98,11 +102,46 @@ std::shared_ptr<syntax::SyntaxTree> SlangDoc::getSyntaxTree() {
 
 std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(bool refreshDependencies) {
     if (!m_analysis || !m_analysis->hasValidBuffers() || refreshDependencies) {
-        // Load dependent documents from driver if not already loaded
-        if (m_dependentDocuments.empty() || refreshDependencies) {
-            m_dependentDocuments = m_driver.getDependentDocs(getSyntaxTree());
+        // Check if this file is an svh included by an owner package. Build-file docs are
+        // top-level packages themselves and never members, so skip the (locked) index lookup.
+        namespace fs = std::filesystem;
+        std::optional<fs::path> ownerPath;
+        if (!m_isFromBuildFile)
+            ownerPath = m_driver.getIndexer().getOwningPackage(
+                fs::path(std::string(m_uri.getPath())));
+        if (ownerPath) {
+            if (auto ownerDoc = m_driver.getDocument(URI::fromFile(*ownerPath))) {
+                auto ownerTree = ownerDoc->getSyntaxTree();
+                auto myPath = fs::path(std::string(m_uri.getPath()));
+                for (auto& meta : ownerTree->getIncludeDirectives()) {
+                    if (!meta.buffer.id.valid())
+                        continue;
+                    if (m_sourceManager.getFullPath(meta.buffer.id) == myPath) {
+                        m_ownerDoc = ownerDoc;
+                        m_ownerBufferId = meta.buffer.id;
+                        m_dependentDocuments.clear();
+                        m_analysis = std::make_shared<ShallowAnalysis>(
+                            m_sourceManager, m_ownerBufferId, ownerTree, m_options,
+                            std::vector<std::shared_ptr<syntax::SyntaxTree>>{ownerTree});
+                        INFO("Analyzed member {} via owner {}", m_uri.getPath(),
+                             ownerPath->string());
+                        return m_analysis;
+                    }
+                }
+            }
         }
 
+        // Standalone analysis (not a member, or owner not found/changed)
+        m_ownerDoc.reset();
+        m_ownerBufferId = {};
+        // Build-file docs are fully self-contained (all includes already expanded in the tree).
+        // Skip getDependentDocs — it would recurse into the full-expansion metadata and
+        // potentially try to open thousands of files.
+        if (!m_isFromBuildFile) {
+            if (m_dependentDocuments.empty() || refreshDependencies) {
+                m_dependentDocuments = m_driver.getDependentDocs(getSyntaxTree());
+            }
+        }
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees = {getSyntaxTree()};
         for (const auto& doc : m_dependentDocuments) {
             if (auto depTree = doc->getSyntaxTree()) {
@@ -118,6 +157,13 @@ std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(bool refreshDependencies)
     }
 
     return m_analysis;
+}
+
+std::optional<slang::SourceLocation> SlangDoc::getLocation(const lsp::Position& position) {
+    // Ensure owner is resolved so m_ownerBufferId is up to date
+    getAnalysis();
+    BufferID effectiveBuffer = m_ownerBufferId.valid() ? m_ownerBufferId : m_buffer.id;
+    return m_sourceManager.getSourceLocation(effectiveBuffer, position.line, position.character);
 }
 
 std::string SlangDoc::getPrevText(const lsp::Position& position) {
@@ -253,30 +299,44 @@ void SlangDoc::issueParseDiagnostics(DiagnosticEngine& diagEngine) {
 }
 
 void SlangDoc::issueDiagnosticsTo(DiagnosticEngine& diagEngine) {
-    // Issue compilation diagnostics
     auto analysis = getAnalysis(true);
     auto& shallowComp = *analysis->getCompilation();
 
-    // Parse diags (just this tree, others will be handled by their SlangDoc objects
-    for (auto& diag : getSyntaxTree()->diagnostics()) {
+    // For member svhs, use the owner's tree for parse diags and the owner buffer for filtering.
+    // For standalone docs, use own tree and own buffer (existing behavior).
+    BufferID effectiveBuffer = m_ownerBufferId.valid() ? m_ownerBufferId : m_buffer.id;
+    auto ownerDoc = m_ownerDoc.lock();
+    auto parseTree = ownerDoc ? ownerDoc->getSyntaxTree() : getSyntaxTree();
+
+    for (auto& diag : parseTree->diagnostics()) {
+        if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != effectiveBuffer)
+            continue;
         diagEngine.issue(diag);
     }
 
-    // Parse and shallow compilation diagnostics
-    // There will be many diags outside the buffer, like unknown modules.
     for (auto& diag : shallowComp.getSemanticDiagnostics()) {
-        if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != m_buffer.id) {
+        if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != effectiveBuffer)
             continue;
-        }
         diagEngine.issue(diag);
     }
-    // Analysis on the shallow compilation (unused, multidriven, etc)
+
     for (auto& diag : analysis->getAnalysisDiags()) {
-        if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != m_buffer.id) {
+        if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != effectiveBuffer)
             continue;
-        }
         diagEngine.issue(diag);
     }
+}
+
+std::vector<lsp::DocumentSymbol> SlangDoc::getSymbols() {
+    // Resolve owner status first: m_ownerBufferId is only populated once getAnalysis() runs.
+    auto analysis = getAnalysis();
+    // For member svhs, build the outline from the svh's own tree so we only show
+    // symbols defined in this file, not the entire owner package.
+    if (m_ownerBufferId.valid()) {
+        SymbolTreeVisitor visitor(m_sourceManager);
+        return visitor.get_symbols(getSyntaxTree(), true);
+    }
+    return analysis->getDocSymbols();
 }
 
 std::vector<lsp::Range> SlangDoc::getInactiveRegions() {

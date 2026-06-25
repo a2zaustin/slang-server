@@ -60,6 +60,16 @@ private:
     /// Shared so that callers can hold the analysis alive even if getAnalysis() recreates it.
     std::shared_ptr<ShallowAnalysis> m_analysis;
 
+    /// If this is an svh included by a package, the owner package doc (weak to avoid cycles).
+    std::weak_ptr<SlangDoc> m_ownerDoc;
+    /// BufferID assigned to this file in the owner's tree (valid only when m_ownerDoc is set).
+    slang::BufferID m_ownerBufferId;
+
+    /// True when this doc was created from a driver-parsed build-file tree. Such docs are
+    /// fully self-contained (the tree already has all includes expanded) so getDependentDocs
+    /// should add them as dependencies but must not recurse into their tree metadata.
+    bool m_isFromBuildFile = false;
+
     // For testing
     friend class DocumentHandle;
 
@@ -79,6 +89,7 @@ public:
 
     SourceManager& getSourceManager() const { return m_sourceManager; }
     const slang::BufferID getBuffer() const { return m_buffer.id; }
+    bool isFromBuildFile() const { return m_isFromBuildFile; }
     const std::string_view getText() const;
     const URI& getURI() { return m_uri; }
     std::string_view getPath() const { return m_uri.getPath(); }
@@ -147,12 +158,9 @@ public:
     void issueDiagnosticsTo(slang::DiagnosticEngine& diagEngine);
 
     /// @brief For the document symbols request
-    // TODO: should this use the shallow compilation instead of syntax tree?
-    std::vector<lsp::DocumentSymbol> getSymbols() { return getAnalysis()->getDocSymbols(); }
+    std::vector<lsp::DocumentSymbol> getSymbols();
 
-    std::optional<slang::SourceLocation> getLocation(const lsp::Position& position) {
-        return m_sourceManager.getSourceLocation(m_buffer.id, position.line, position.character);
-    }
+    std::optional<slang::SourceLocation> getLocation(const lsp::Position& position);
 
     // Previous text on and before a position
     std::string getPrevText(const lsp::Position& position);

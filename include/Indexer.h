@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "slang/syntax/SyntaxTree.h"
+#include "slang/text/SourceManager.h"
 #include "slang/util/SmallVector.h"
 
 namespace slang::syntax {
@@ -55,6 +56,21 @@ struct Indexer {
 
     // For open document lifecycle
     void updateDocument(const std::filesystem::path& uri, const slang::syntax::SyntaxTree& tree);
+
+    /// Index the top-level declared symbols of an already-parsed build-file tree, if the path is
+    /// not already indexed. This makes externally-located packages (e.g. uvm_pkg outside the
+    /// workspace) navigable via goto-def. Only declared symbols are taken — not referenced ones —
+    /// since a fully-expanded build tree references the entire compiled universe.
+    void addBuildSource(const std::filesystem::path& path, const slang::syntax::SyntaxTree& tree);
+
+    /// Record the includes found in a fully-expanded package tree so that svh members can be
+    /// routed through their owner's analysis. Only populates entries when meta.buffer.id is valid
+    /// (i.e. the tree was parsed with full include expansion, not depth-0).
+    void registerPackageIncludes(const std::filesystem::path& pkgPath,
+                                 const slang::syntax::SyntaxTree& tree, slang::SourceManager& sm);
+
+    /// Returns the path of the package that directly includes this file, if known.
+    std::optional<std::filesystem::path> getOwningPackage(const std::filesystem::path& path) const;
 
     //////////////////////////////////////////
     // Querying interface
@@ -119,6 +135,10 @@ private:
 
     // Storage for all indexed files (for efficient removal)
     std::unordered_map<const std::filesystem::path*, IndexedPath> indexedFiles;
+
+    // Maps included svh absolute path -> owner package absolute path.
+    // Populated from fully-expanded build-file trees; empty entries mean depth-0 parse.
+    std::unordered_map<std::filesystem::path, std::filesystem::path> includeToOwner_;
 
     // Extracts symbols and referenced symbols
     static void extractFromRoot(const slang::syntax::CompilationUnitSyntax& root,

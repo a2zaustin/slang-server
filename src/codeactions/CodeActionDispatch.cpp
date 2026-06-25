@@ -32,8 +32,7 @@ std::vector<rfl::Variant<lsp::Command, lsp::CodeAction>> CodeActionDispatch::get
     const parsing::Token* token = nullptr;
     const syntax::SyntaxNode* syntax = nullptr;
 
-    auto loc = m_sourceManager.getSourceLocation(doc->getBuffer(), params.range.start.line,
-                                                 params.range.start.character);
+    auto loc = doc->getLocation(params.range.start);
     if (loc) {
         token = analysis->syntaxes.getWordTokenAt(*loc);
         if (token)
