@@ -70,6 +70,12 @@ private:
     /// should add them as dependencies but must not recurse into their tree metadata.
     bool m_isFromBuildFile = false;
 
+    /// Cache for getIncludeBuffer(): resolved-include-path -> BufferID, valid for the tree it was
+    /// built from. Rebuilt when the tree pointer changes (a reparse reassigns include buffer ids),
+    /// so the many member svhs sharing one owner package don't each rescan its include list.
+    const slang::syntax::SyntaxTree* m_includeBufferKey = nullptr;
+    std::unordered_map<std::filesystem::path, slang::BufferID> m_includeBuffers;
+
     // For testing
     friend class DocumentHandle;
 
@@ -96,6 +102,10 @@ public:
 
     /// @brief Get the syntax tree, creating it if necessary
     std::shared_ptr<slang::syntax::SyntaxTree> getSyntaxTree();
+
+    /// @brief BufferID assigned to `includedPath` within this doc's current tree, or an invalid
+    /// id if this doc doesn't include it. Cached per tree version (see m_includeBuffers).
+    slang::BufferID getIncludeBuffer(const std::filesystem::path& includedPath);
 
     /// @brief Check if analysis exists without creating it
     bool hasAnalysis() const { return m_analysis != nullptr && m_analysis->hasValidBuffers(); }

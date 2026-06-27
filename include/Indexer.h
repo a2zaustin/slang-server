@@ -63,9 +63,11 @@ struct Indexer {
     /// since a fully-expanded build tree references the entire compiled universe.
     void addBuildSource(const std::filesystem::path& path, const slang::syntax::SyntaxTree& tree);
 
-    /// Record the includes found in a fully-expanded package tree so that svh members can be
-    /// routed through their owner's analysis. Only populates entries when meta.buffer.id is valid
-    /// (i.e. the tree was parsed with full include expansion, not depth-0).
+    /// Record the includes that occur lexically inside a package declaration in a fully-expanded
+    /// tree, so those svh members can be routed through their owner's analysis. Includes at
+    /// module/top-level scope are ignored (they expand normally and must not be hijacked).
+    /// Only populates entries when meta.buffer.id is valid (i.e. the tree was parsed with full
+    /// include expansion, not depth-0).
     void registerPackageIncludes(const std::filesystem::path& pkgPath,
                                  const slang::syntax::SyntaxTree& tree, slang::SourceManager& sm);
 
@@ -139,6 +141,9 @@ private:
     // Maps included svh absolute path -> owner package absolute path.
     // Populated from fully-expanded build-file trees; empty entries mean depth-0 parse.
     std::unordered_map<std::filesystem::path, std::filesystem::path> includeToOwner_;
+    // Reverse index: owner package path -> the svh paths it owns. Lets registerPackageIncludes
+    // clear a package's stale entries in O(its own includes) instead of scanning the whole map.
+    std::unordered_map<std::filesystem::path, std::vector<std::filesystem::path>> ownerToIncludes_;
 
     // Extracts symbols and referenced symbols
     static void extractFromRoot(const slang::syntax::CompilationUnitSyntax& root,

@@ -100,6 +100,21 @@ std::shared_ptr<syntax::SyntaxTree> SlangDoc::getSyntaxTree() {
     return m_tree;
 }
 
+slang::BufferID SlangDoc::getIncludeBuffer(const std::filesystem::path& includedPath) {
+    auto tree = getSyntaxTree();
+    if (tree.get() != m_includeBufferKey) {
+        m_includeBuffers.clear();
+        for (auto& meta : tree->getIncludeDirectives()) {
+            if (meta.buffer.id.valid())
+                m_includeBuffers.try_emplace(m_sourceManager.getFullPath(meta.buffer.id),
+                                             meta.buffer.id);
+        }
+        m_includeBufferKey = tree.get();
+    }
+    auto it = m_includeBuffers.find(includedPath);
+    return it != m_includeBuffers.end() ? it->second : slang::BufferID{};
+}
+
 std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(bool refreshDependencies) {
     if (!m_analysis || !m_analysis->hasValidBuffers() || refreshDependencies) {
         // Check if this file is an svh included by an owner package. Build-file docs are
@@ -111,22 +126,29 @@ std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(bool refreshDependencies)
                 fs::path(std::string(m_uri.getPath())));
         if (ownerPath) {
             if (auto ownerDoc = m_driver.getDocument(URI::fromFile(*ownerPath))) {
-                auto ownerTree = ownerDoc->getSyntaxTree();
+                // Ask the owner for our buffer in its *current* tree. A reparse reassigns
+                // include buffer ids, so we can't reuse the build-time id from the index; the
+                // owner caches this lookup per tree version so members don't each rescan.
                 auto myPath = fs::path(std::string(m_uri.getPath()));
-                for (auto& meta : ownerTree->getIncludeDirectives()) {
-                    if (!meta.buffer.id.valid())
-                        continue;
-                    if (m_sourceManager.getFullPath(meta.buffer.id) == myPath) {
-                        m_ownerDoc = ownerDoc;
-                        m_ownerBufferId = meta.buffer.id;
-                        m_dependentDocuments.clear();
-                        m_analysis = std::make_shared<ShallowAnalysis>(
-                            m_sourceManager, m_ownerBufferId, ownerTree, m_options,
-                            std::vector<std::shared_ptr<syntax::SyntaxTree>>{ownerTree});
-                        INFO("Analyzed member {} via owner {}", m_uri.getPath(),
-                             ownerPath->string());
-                        return m_analysis;
+                auto bufId = ownerDoc->getIncludeBuffer(myPath);
+                if (bufId.valid()) {
+                    m_ownerDoc = ownerDoc;
+                    m_ownerBufferId = bufId;
+                    auto ownerTree = ownerDoc->getSyntaxTree();
+                    // Pull in the packages the owner imports so cross-package references inside
+                    // this member (e.g. a type from another package the owner `import`s) resolve.
+                    if (m_dependentDocuments.empty() || refreshDependencies)
+                        m_dependentDocuments = m_driver.getDependentDocs(ownerTree);
+                    std::vector<std::shared_ptr<syntax::SyntaxTree>> trees = {ownerTree};
+                    for (const auto& dep : m_dependentDocuments) {
+                        if (auto depTree = dep->getSyntaxTree())
+                            trees.push_back(depTree);
                     }
+                    m_analysis = std::make_shared<ShallowAnalysis>(
+                        m_sourceManager, m_ownerBufferId, ownerTree, m_options, trees);
+                    INFO("Analyzed member {} via owner {}", m_uri.getPath(),
+                         ownerPath->string());
+                    return m_analysis;
                 }
             }
         }
@@ -134,13 +156,22 @@ std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(bool refreshDependencies)
         // Standalone analysis (not a member, or owner not found/changed)
         m_ownerDoc.reset();
         m_ownerBufferId = {};
-        // Build-file docs are fully self-contained (all includes already expanded in the tree).
-        // Skip getDependentDocs — it would recurse into the full-expansion metadata and
-        // potentially try to open thousands of files.
-        if (!m_isFromBuildFile) {
-            if (m_dependentDocuments.empty() || refreshDependencies) {
-                m_dependentDocuments = m_driver.getDependentDocs(getSyntaxTree());
+        // Build-file docs normally skip getDependentDocs: a fully-expanded top-level (module/tb)
+        // tree references the whole compiled universe, so the dependency walk would open
+        // thousands of files. But a package/interface build-file has a bounded reference set and
+        // needs the packages it `import`s resolved for cross-package navigation, so still walk it.
+        bool computeDeps = !m_isFromBuildFile;
+        if (m_isFromBuildFile) {
+            for (auto& [decl, _] : getSyntaxTree()->getMetadata().nodeMeta) {
+                if (decl->kind == syntax::SyntaxKind::PackageDeclaration ||
+                    decl->kind == syntax::SyntaxKind::InterfaceDeclaration) {
+                    computeDeps = true;
+                    break;
+                }
             }
+        }
+        if (computeDeps && (m_dependentDocuments.empty() || refreshDependencies)) {
+            m_dependentDocuments = m_driver.getDependentDocs(getSyntaxTree());
         }
         std::vector<std::shared_ptr<syntax::SyntaxTree>> trees = {getSyntaxTree()};
         for (const auto& doc : m_dependentDocuments) {

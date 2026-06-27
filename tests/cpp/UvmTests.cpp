@@ -33,6 +33,35 @@ TEST_CASE("MemberSvhSymbolsFromOwnTree") {
     CHECK(symbols[0].name == "MemberClass");
 }
 
+TEST_CASE("MemberResolvesSymbolFromPackageImportedByOwner") {
+    // a_member.svh (member of pkg_a) references b_byte_t from pkg_b, which pkg_a `import`s.
+    // Routing through pkg_a must also pull in pkg_b (an owner dependency) so the cross-package
+    // type resolves — goto-def on b_byte_t should land in pkg_b.sv.
+    ServerHarness server("pkg_cross");
+    server.setBuildFile("pkg_cross.f");
+    auto svh = server.openFile("src/a_member.svh");
+
+    auto cursor = svh.after("b_by");
+    auto defs = cursor.getDefinitions();
+    REQUIRE(!defs.empty());
+    CHECK(std::string(defs[0].targetUri.getPath()).find("pkg_b.sv") != std::string::npos);
+}
+
+TEST_CASE("BuildPackageResolvesImportedPackageSymbol") {
+    // pkg_a.sv is itself a build source (listed in the .f), so it stays an isFromBuildFile doc on
+    // open. Such docs normally skip dependency resolution, but a package build-file must still
+    // resolve the packages it `import`s — goto-def on b_byte_t (a pkg_b type used at pkg_a scope)
+    // should land in pkg_b.sv.
+    ServerHarness server("pkg_cross");
+    server.setBuildFile("pkg_cross.f");
+    auto pa = server.openFile("pkg_a.sv");
+
+    auto cursor = pa.after("b_by");
+    auto defs = cursor.getDefinitions();
+    REQUIRE(!defs.empty());
+    CHECK(std::string(defs[0].targetUri.getPath()).find("pkg_b.sv") != std::string::npos);
+}
+
 TEST_CASE("GotoIncludeResolvesThroughIncludeOnceGuard") {
     ServerHarness server("nested_include");
     server.setBuildFile("nested_include.f");

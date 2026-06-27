@@ -71,7 +71,6 @@ void Indexer::extractMacros(const MacroRange& macros, IndexedPath& dest) {
     }
 }
 
-// TODO look at for speed improvements
 std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path>& paths) const {
     using namespace slang;
     using namespace parsing;
@@ -89,7 +88,6 @@ std::vector<Indexer::IndexedPath> Indexer::indexPaths(const std::vector<fs::path
     auto processRange = [&loadResults, &paths](size_t start, size_t end) {
         SourceManager sourceManager;
         Bag options;
-        // TODO why is this set to 0
         options.set(PreprocessorOptions{.maxIncludeDepth = 0});
 
         SmallVector<char> bufferData;
@@ -142,7 +140,6 @@ const fs::path* Indexer::internUri(const fs::path& path) {
     return &(*it);
 }
 
-// TODO look at for speed improvements
 void Indexer::updateDocument(const fs::path& path, const slang::syntax::SyntaxTree& tree) {
     IndexWriteGuard guard(*this);
 
@@ -215,7 +212,6 @@ void Indexer::updateDocument(const fs::path& path, const slang::syntax::SyntaxTr
     indexedFiles[uriPtr] = std::move(newPath);
 }
 
-// TODO look at for speed improvements
 void Indexer::indexPath(const fs::path& path, IndexedPath& indexedFile) {
     const fs::path* uriPtr = internUri(path);
     indexedFile.path = uriPtr;
@@ -401,19 +397,21 @@ void Indexer::registerPackageIncludes(const fs::path& pkgPath,
                                       const slang::syntax::SyntaxTree& tree,
                                       slang::SourceManager& sm) {
     IndexWriteGuard guard(*this);
-    // Clear stale entries for this package before re-registering
-    for (auto it = includeToOwner_.begin(); it != includeToOwner_.end();) {
-        if (it->second == pkgPath)
-            it = includeToOwner_.erase(it);
-        else
-            ++it;
-    }
+    // Clear this package's prior entries via the reverse index, so re-registration costs
+    // O(its own includes) rather than a scan of the whole map.
+    auto& owned = ownerToIncludes_[pkgPath];
+    for (auto& inc : owned)
+        includeToOwner_.erase(inc);
+    owned.clear();
+
     for (auto& meta : tree.getIncludeDirectives()) {
         if (!meta.buffer.id.valid())
             continue;
         auto resolved = sm.getFullPath(meta.buffer.id);
-        if (!resolved.empty())
-            includeToOwner_[resolved] = pkgPath;
+        if (resolved.empty())
+            continue;
+        includeToOwner_[resolved] = pkgPath;
+        owned.push_back(resolved);
     }
 }
 
